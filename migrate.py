@@ -211,12 +211,7 @@ def check_sqlite_integrity(db_path: Path) -> bool:
         console.print(f"[bold red]Error during integrity check:[/] {str(e)}")
         return False
 
-def sqlite_to_pg_type(sqlite_type: str, column_name: str) -> str:
-    # Special handling for known JSON columns in the group table
-    json_columns = {'data', 'meta', 'permissions', 'user_ids'}
-    if column_name in json_columns:
-        return 'JSONB'
-
+def sqlite_to_pg_type(sqlite_type: str) -> str:
     types = {
         'INTEGER': 'INTEGER',
         'REAL': 'DOUBLE PRECISION',
@@ -280,11 +275,6 @@ async def process_table(
     progress: Progress,
     batch_size: int
 ) -> None:
-    # Special handling for group table
-    is_group_table = table_name.lower() == 'group'
-    if is_group_table:
-        console.print("[cyan]Processing group table - enabling detailed logging[/]")
-
     pg_safe_table_name = get_pg_safe_identifier(table_name)
     sqlite_safe_table_name = get_sqlite_safe_identifier(table_name)
 
@@ -332,10 +322,9 @@ async def process_table(
         # Create table if it doesn't exist
         if not pg_column_types:
             try:
-                columns = [f"{get_pg_safe_identifier(col[1])} {sqlite_to_pg_type(col[2], col[1])}"
+                columns = [f"{get_pg_safe_identifier(col[1])} {sqlite_to_pg_type(col[2])}"
                           for col in schema]
                 create_query = f"CREATE TABLE IF NOT EXISTS {pg_safe_table_name} ({', '.join(columns)})"
-                console.print(f"[cyan]Creating table with query:[/] {create_query}")
                 pg_cursor.execute(create_query)
                 pg_cursor.connection.commit()
             except psycopg.Error as e:
@@ -377,10 +366,8 @@ async def process_table(
                             cleaned_row.append(item)
                     rows.append(tuple(cleaned_row))
 
-                for row_index, row in enumerate(rows):
+                for row in rows:
                     try:
-                        if is_group_table:
-                            console.print(f"[cyan]Processing group row {processed_rows + row_index}[/]")
                         col_names = [get_pg_safe_identifier(col[1]) for col in schema]
                         values = []
                         for i, value in enumerate(row):
@@ -392,20 +379,9 @@ async def process_table(
                             elif col_type == 'boolean':
                                 values.append('true' if value == 1 else 'false')
                             elif isinstance(value, str):
-                                # Check if this is a JSON column
-                                if col_type == 'jsonb':
-                                    try:
-                                        # Try to parse as JSON to validate
-                                        import json
-                                        json.loads(value)
-                                        values.append(f"'{value}'::jsonb")
-                                    except json.JSONDecodeError as e:
-                                        console.print(f"[yellow]Warning: Invalid JSON in {col_name}: {e}[/]")
-                                        values.append("'{}'::jsonb")
-                                else:
-                                    escaped_value = value.replace(chr(39), chr(39)*2)
-                                    escaped_value = escaped_value.replace('\x00', '')
-                                    values.append(f"'{escaped_value}'")
+                                escaped_value = value.replace(chr(39), chr(39)*2)
+                                escaped_value = escaped_value.replace('\x00', '')
+                                values.append(f"'{escaped_value}'")
                             else:
                                 values.append(str(value))
 
@@ -414,16 +390,9 @@ async def process_table(
                             ({', '.join(col_names)})
                             VALUES ({', '.join(values)})
                         """
-                        if is_group_table:
-                            console.print(f"[cyan]Executing query:[/]\n{insert_query}")
                         pg_cursor.execute(insert_query)
                     except Exception as e:
-                        if is_group_table:
-                            console.print(f"[red]Error processing group row {processed_rows + row_index}:[/]")
-                            console.print(f"[red]Row data:[/] {row}")
-                            console.print(f"[red]Error details:[/] {str(e)}")
-                        else:
-                            console.print(f"[red]Error processing row in {table_name}: {e}[/]")
+                        console.print(f"[red]Error processing row in {table_name}: {e}[/]")
                         failed_rows.append((table_name, processed_rows + len(failed_rows), str(e)))
                         continue
 
@@ -472,8 +441,30 @@ async def migrate() -> None:
         sqlite_cursor = sqlite_conn.cursor()
         pg_cursor = pg_conn.cursor()
 
-        sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = sqlite_cursor.fetchall()
+        # Define the migration order
+        migration_order = [
+            "auth",
+            "user",
+            "group",
+            "channel",
+            "channel_member",
+            "chat",
+            "chatidtag",
+            "config",
+            "document",
+            "feedback",
+            "file",
+            "folder",
+            "function",
+            "knowledge",
+            "memory",
+            "message",
+            "message_reaction",
+            "model",
+            "prompt",
+            "tag",
+            "tool"
+        ]
 
         with Progress(
             SpinnerColumn(),
@@ -482,7 +473,7 @@ async def migrate() -> None:
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         ) as progress:
             try:
-                for (table_name,) in tables:
+                for table_name in migration_order:
                     if table_name in ("migratehistory", "alembic_version"):
                         continue
 
@@ -499,7 +490,7 @@ async def migrate() -> None:
             except Exception as e:
                 console.print(f"[bold red]Critical error during migration:[/] {e}")
                 console.print("[red]Stack trace:[/]")
-                console.print(traceback.format_exc())
+                traceback.format_exc()
                 pg_conn.rollback()
                 sys.exit(1)
 
